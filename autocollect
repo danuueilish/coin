@@ -1,68 +1,180 @@
--- StarterPlayerScripts/AutoCollectTP.client.lua
--- GUI Toggle Auto Collect Coin + Teleport
+-- StarterPlayerScripts/AutoCollectTP_Debug.client.lua
+-- Toggle GUI + Auto-TP + InvokeServer(PickupCoin) dengan fallback pencarian dan debug
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
 local RunService        = game:GetService("RunService")
 local LocalPlayer       = Players.LocalPlayer
 
--- Folder coin sesuai penjelasan kamu
-local coinsFolder = workspace:WaitForChild("PickupCoin")
+-- ======= CARI REMOTEFUNCTION "PickupCoin" SECARA DINAMIS =======
+local function findPickupRF()
+    -- 1) Langsung di ReplicatedStorage.RemoteFunctions
+    local rfFolder = ReplicatedStorage:FindFirstChild("RemoteFunctions")
+    if rfFolder and rfFolder:FindFirstChild("PickupCoin") then
+        return rfFolder.PickupCoin
+    end
+    -- 2) Cari di seluruh descendant ReplicatedStorage
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteFunction") and obj.Name == "PickupCoin" then
+            return obj
+        end
+    end
+    return nil
+end
 
--- RemoteFunction pickup resmi
-local pickupRF = ReplicatedStorage:WaitForChild("RemoteFunctions"):WaitForChild("PickupCoin")
+local pickupRF = findPickupRF()
+if not pickupRF then
+    warn("[AutoCollect] RemoteFunction 'PickupCoin' TIDAK DITEMUKAN di ReplicatedStorage. Cek path-nya!")
+else
+    print("[AutoCollect] PickupRF OK ->", pickupRF:GetFullName())
+end
 
--- === GUI sederhana ===
-local gui = Instance.new("ScreenGui")
-gui.Name = "AutoCollectUI"
+-- ======= CARI KUMPULAN COIN =======
+local function getCoinCandidates()
+    local coins = {}
+
+    -- A) Folder workspace.PickupCoin (sesuai katamu)
+    local folder = workspace:FindFirstChild("PickupCoin")
+    if folder then
+        for _, m in ipairs(folder:GetChildren()) do
+            if m:IsA("Model") then
+                table.insert(coins, m)
+            end
+        end
+    end
+
+    -- B) Tag "Coin" (kalau kamu pakai CollectionService)
+    for _, m in ipairs(CollectionService:GetTagged("Coin")) do
+        if m:IsA("Model") then
+            table.insert(coins, m)
+        end
+    end
+
+    -- C) Fallback scan: semua MODEL di workspace yang punya child "Root"
+    if #coins == 0 then
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d:IsA("Model") and d:FindFirstChild("Root") then
+                table.insert(coins, d)
+            end
+        end
+    end
+
+    return coins
+end
+
+-- ======= GUI =======
+local gui   = Instance.new("ScreenGui")
+gui.Name    = "AutoCollectUI"
 gui.ResetOnSpawn = false
-gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+gui.Parent  = LocalPlayer:WaitForChild("PlayerGui")
 
-local btn = Instance.new("TextButton")
-btn.Size = UDim2.fromOffset(170, 42)
-btn.Position = UDim2.new(0, 20, 0, 70)
+local btn   = Instance.new("TextButton")
+btn.Name    = "ToggleBtn"
+btn.Size    = UDim2.fromOffset(190, 44)
+btn.Position= UDim2.new(0, 20, 0, 70)
 btn.TextScaled = true
-btn.BackgroundColor3 = Color3.fromRGB(220, 130, 130)
-btn.Text = "Auto Collect: OFF"
-btn.Parent = gui
+btn.BackgroundTransparency = 0.1
+btn.BackgroundColor3 = Color3.fromRGB(220,130,130)
+btn.Text    = "Auto Collect: OFF"
+btn.Parent  = gui
 
-local uiCorner = Instance.new("UICorner")
-uiCorner.CornerRadius = UDim.new(0, 8)
-uiCorner.Parent = btn
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = btn
 
 local autoOn = false
-local function updateBtn()
-	btn.Text = autoOn and "Auto Collect: ON" or "Auto Collect: OFF"
-	btn.BackgroundColor3 = autoOn and Color3.fromRGB(110, 220, 140) or Color3.fromRGB(220, 130, 130)
+local function setBtn(state)
+    autoOn = state
+    btn.Text = autoOn and "Auto Collect: ON" or "Auto Collect: OFF"
+    btn.BackgroundColor3 = autoOn and Color3.fromRGB(110,220,140) or Color3.fromRGB(220,130,130)
 end
-updateBtn()
+setBtn(false)
 
 btn.MouseButton1Click:Connect(function()
-	autoOn = not autoOn
-	updateBtn()
+    setBtn(not autoOn)
+    if autoOn then
+        print("[AutoCollect] ON")
+    else
+        print("[AutoCollect] OFF")
+    end
 end)
 
--- === Loop teleport + collect ===
-local INTERVAL = 0.4 -- delay antar coin (biar nggak terlalu spam)
+-- Toggle cepat: RightShift
+game:GetService("UserInputService").InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        setBtn(not autoOn)
+        print("[AutoCollect] Toggle via RightShift ->", autoOn and "ON" or "OFF")
+    end
+end)
 
-RunService.Heartbeat:Connect(function(dt)
-	if not autoOn then return end
+-- ======= LOGIKA AUTO-TP + INVOKE =======
+local INTERVAL = 0.4      -- delay antar coin
+local ABOVE_Y  = 3        -- teleport sedikit di atas coin
+local SAFETY_TRIES = 2    -- ulang invoke dikit kalau pertama gagal
 
-	local char = LocalPlayer.Character
-	local hrp = char and char:FindFirstChild("HumanoidRootPart")
-	if not hrp then return end
-	if not pickupRF then return end
+local function tpTo(cf)
+    local char = LocalPlayer.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+    -- langsung set CFrame (simulasi cheater)
+    hrp.CFrame = cf
+    return true
+end
 
-	-- cari coin pertama yang masih ada
-	for _, coin in ipairs(coinsFolder:GetChildren()) do
-		if coin:IsA("Model") and coin:FindFirstChild("Root") then
-			-- teleport player ke coin
-			hrp.CFrame = coin.Root.CFrame + Vector3.new(0, 3, 0) -- sedikit di atas coin
-			-- invoke server pickup
-			pcall(function()
-				pickupRF:InvokeServer(coin)
-			end)
-			task.wait(INTERVAL) -- tunggu sebelum pindah ke coin berikutnya
-		end
-	end
+local function tryPickup(coin)
+    if not pickupRF then return false end
+    local ok, res = pcall(function()
+        return pickupRF:InvokeServer(coin)
+    end)
+    if not ok then
+        warn("[AutoCollect] InvokeServer error:", res)
+        return false
+    end
+    -- Banyak server mengembalikan true/false saat sukses.
+    -- Kalau nggak mengembalikan apa-apa, res bisa nil -> anggap sukses tapi tulis log.
+    if res == true then
+        return true
+    else
+        -- debug info
+        print("[AutoCollect] InvokeServer returned:", tostring(res))
+        return res == nil and true or false
+    end
+end
+
+-- Loop utama
+task.spawn(function()
+    while true do
+        if autoOn and pickupRF then
+            local coins = getCoinCandidates()
+            if #coins == 0 then
+                -- sekali-sekali kasih info
+                -- print("[AutoCollect] Tidak menemukan coin apa pun.")
+            end
+            for _, coin in ipairs(coins) do
+                -- Pastikan coin masih ada & punya Root / PrimaryPart
+                if coin.Parent and (coin:FindFirstChild("Root") or coin.PrimaryPart) then
+                    local root = coin:FindFirstChild("Root")
+                    local cf   = (root and root.CFrame or coin:GetPivot()) + Vector3.new(0, ABOVE_Y, 0)
+                    local moved = tpTo(cf)
+                    if moved then
+                        -- beri sedikit waktu supaya posisi tersinkron (beberapa server cek proximity)
+                        task.wait(0.1)
+                        local success = tryPickup(coin)
+                        if not success then
+                            -- coba lagi 1-2 kali
+                            for _ = 1, SAFETY_TRIES do
+                                task.wait(0.1)
+                                if tryPickup(coin) then break end
+                            end
+                        end
+                        task.wait(INTERVAL)
+                    end
+                end
+                if not autoOn then break end
+            end
+        end
+        task.wait(0.1)
+    end
 end)
