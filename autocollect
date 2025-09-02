@@ -1,0 +1,58 @@
+-- StarterPlayerScripts/AutoCollect.client.lua
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local coinsFolder = workspace:WaitForChild("Coins") -- pastikan folder Coins ada
+local pickupRF = ReplicatedStorage:WaitForChild("RemoteFunctions"):WaitForChild("PickupCoin")
+
+-- GUI
+local gui = Instance.new("ScreenGui")
+gui.Name = "AutoCollectUI"
+gui.ResetOnSpawn = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local btn = Instance.new("TextButton")
+btn.Size = UDim2.new(0, 160, 0, 40)
+btn.Position = UDim2.new(0, 20, 0, 60)
+btn.TextScaled = true
+btn.BackgroundColor3 = Color3.fromRGB(255,180,180)
+btn.Text = "Auto Collect: OFF"
+btn.Parent = gui
+
+-- state
+local autoOn = false
+
+local function updateBtn()
+	btn.Text = autoOn and "Auto Collect: ON" or "Auto Collect: OFF"
+	btn.BackgroundColor3 = autoOn and Color3.fromRGB(120,255,120) or Color3.fromRGB(255,180,180)
+end
+
+btn.MouseButton1Click:Connect(function()
+	autoOn = not autoOn
+	updateBtn()
+end)
+
+-- loop collect
+RunService.Heartbeat:Connect(function()
+	if not autoOn then return end
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	for _, coin in ipairs(coinsFolder:GetChildren()) do
+		if coin:IsA("Model") and coin:FindFirstChild("Root") then
+			local dist = (coin.Root.Position - hrp.Position).Magnitude
+			if dist < 12 then -- radius collect 12 stud
+				-- panggil fungsi pickup resmi
+				pcall(function()
+					pickupRF:InvokeServer(coin)
+				end)
+			end
+		end
+	end
+end)
+
+updateBtn()
