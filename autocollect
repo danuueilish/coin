@@ -1,49 +1,54 @@
--- StarterPlayerScripts/AutoFarmTools.client.lua
--- Tegel: 2 fitur dalam satu GUI
---   1) Auto Coin  (Teleport ke coin + InvokeServer("PickupCoin"))
---   2) Auto Finish (Teleport ke START_POS -> maju-mundur 8 stud sampai Confetti muncul -> Teleport ke Portal -> loop)
---
--- Catatan:
--- - Confetti dideteksi dari kemunculan/mutasi PlayerGui.ConfettiGui (efekmu bikin ScreenGui "ConfettiGui" dan 100 frame). [lihat file confetti kamu]
--- - Pastikan RemoteFunction "PickupCoin" ada di ReplicatedStorage (bisa di mana saja di dalamnya).
--- - Folder coin: workspace.PickupCoin (isi Model coin, punya PrimaryPart / child "Root" yang jadi pivot).
--- - Portal: otomatis cari Part bernama "Portal" atau child di folder "Portals".
---   Jika tak ada, set manual di konstanta PORTAL_POS di bawah.
+-- StarterPlayerScripts/AutoFarmTools_HitboxOnly.client.lua
+-- 2 tombol: Auto Coin + Auto Finish
+-- Auto Finish hanya teleport ke part bernama persis "Hitbox" (bukan Hitbox1, Hitbox2, dst)
 
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local RunService          = game:GetService("RunService")
-local TweenService        = game:GetService("TweenService")
-local CollectionService   = game:GetService("CollectionService")
-local UserInputService    = game:GetService("UserInputService")
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local TweenService      = game:GetService("TweenService")
+local CollectionService = game:GetService("CollectionService")
+local UserInputService  = game:GetService("UserInputService")
 
 local LP = Players.LocalPlayer
 
--- ======== KONFIGURASI ========
-local START_POS   = Vector3.new(-782.0, 97.2, 1298.0)   -- titik awal “finish run” kamu
-local STEP_DIST   = 8                                   -- maju/mundur 8 stud
-local MOVE_TIME   = 0.25                                -- durasi tween maju/mundur
-local COIN_INTERVAL = 0.40                              -- jarak waktu antar TP coin
-local COIN_ABOVE   = 3                                  -- teleport sedikit di atas coin
-local PORTAL_POS   = nil                                -- set Vector3.new(...) kalau mau paksa portal pos
-local CONFETTI_TIMEOUT = 10                             -- detik: maksimal menunggu confetti sebelum ulangi pola gerak
+-- ========= KONFIG =========
+local START_POS       = Vector3.new(-782.0, 97.2, 1298.0)
+local STEP_DIST       = 8
+local MOVE_TIME       = 0.25
+local COIN_INTERVAL   = 0.40
+local COIN_ABOVE      = 3
+local CONFETTI_TIMEOUT= 10
+local CONFETTI_MIN_CHILDREN = 40
+local PORTAL_PATH = {"Ending","Portal","Portal"} -- folder berisi Hitbox
 
--- ======== Utility: ambil HRP ========
-local function getHRP()
+-- ========= UTIL =========
+local function HRP()
     local char = LP.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    return hrp
+    return char and char:FindFirstChild("HumanoidRootPart")
 end
 
--- ======== Cari RemoteFunction "PickupCoin" secara dinamis ========
+local function tpCFrame(cf)
+    local hrp = HRP(); if not hrp then return false end
+    hrp.CFrame = cf; return true
+end
+
+local function tpVector3(v)
+    return tpCFrame(CFrame.new(v))
+end
+
+local function tweenTo(cfTo, t)
+    local hrp = HRP(); if not hrp then return false end
+    local tw = TweenService:Create(hrp, TweenInfo.new(t or MOVE_TIME, Enum.EasingStyle.Linear), {CFrame = cfTo})
+    tw:Play(); tw.Completed:Wait(); return true
+end
+
+-- ========= PickupCoin RF =========
 local function findPickupRF()
-    -- 1) Coba path umum
-    local rfFolder = ReplicatedStorage:FindFirstChild("RemoteFunctions")
-    if rfFolder then
-        local rf = rfFolder:FindFirstChild("PickupCoin")
+    local folder = ReplicatedStorage:FindFirstChild("RemoteFunctions")
+    if folder then
+        local rf = folder:FindFirstChild("PickupCoin")
         if rf and rf:IsA("RemoteFunction") then return rf end
     end
-    -- 2) Scan semua descendant ReplicatedStorage
     for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
         if obj:IsA("RemoteFunction") and obj.Name == "PickupCoin" then
             return obj
@@ -51,254 +56,194 @@ local function findPickupRF()
     end
     return nil
 end
-
 local pickupRF = findPickupRF()
-if not pickupRF then
-    warn("[AutoTools] RemoteFunction 'PickupCoin' tidak ditemukan di ReplicatedStorage. Cek nama/path-nya.")
-else
-    print("[AutoTools] PickupRF:", pickupRF:GetFullName())
-end
 
--- ======== Daftar coin candidates ========
+-- ========= Coin list =========
 local function getCoinModels()
     local t = {}
-    -- Prioritas: folder workspace.PickupCoin
     local folder = workspace:FindFirstChild("PickupCoin")
     if folder then
         for _, m in ipairs(folder:GetChildren()) do
-            if m:IsA("Model") then
-                table.insert(t, m)
-            end
+            if m:IsA("Model") then table.insert(t, m) end
         end
     end
-    -- Tambahan (opsional): Tag "Coin" via CollectionService
     for _, m in ipairs(CollectionService:GetTagged("Coin")) do
-        if m:IsA("Model") then
-            table.insert(t, m)
-        end
+        if m:IsA("Model") then table.insert(t, m) end
     end
     return t
 end
 
-local function getModelPivotCF(model)
-    local pp = model:FindFirstChild("Root") or model.PrimaryPart
-    if pp then return pp.CFrame end
-    -- fallback pivot
-    if model.GetPivot then
-        return model:GetPivot()
-    end
+local function modelPivotCF(model)
+    local root = model:FindFirstChild("Root") or model.PrimaryPart
+    if root then return root.CFrame end
+    if model.GetPivot then return model:GetPivot() end
     return nil
 end
 
--- ======== Teleport helper ========
-local function tpCFrame(cf)
-    local hrp = getHRP()
-    if not hrp then return false end
-    hrp.CFrame = cf
-    return true
-end
+-- ========= Confetti detector =========
+local confettiFlag = false
+local function setupConfettiWatch()
+    confettiFlag = false
+    local pg = LP:WaitForChild("PlayerGui")
 
-local function tpVector3(pos)
-    local hrp = getHRP()
-    if not hrp then return false end
-    hrp.CFrame = CFrame.new(pos)
-    return true
-end
-
--- ======== Tween gerak maju/mundur 8 stud ========
-local function tweenTo(cfTo)
-    local hrp = getHRP()
-    if not hrp then return false end
-    local tween = TweenService:Create(hrp, TweenInfo.new(MOVE_TIME, Enum.EasingStyle.Linear), {CFrame = cfTo})
-    tween:Play()
-    tween.Completed:Wait()
-    return true
-end
-
--- ======== Deteksi Confetti ========
--- Efek confetti milikmu akan memastikan ada ScreenGui "ConfettiGui" di PlayerGui dan mengisinya dengan banyak Frame partikel.  [oai_citation:2‡confetti.txt](file-service://file-4s6e2E5rknJNuW4kETRtie)
-local function waitForConfetti(timeoutSec)
-    timeoutSec = timeoutSec or CONFETTI_TIMEOUT
-    local gui = LP:WaitForChild("PlayerGui")
-    local startTime = os.clock()
-    local confettiGui = gui:FindFirstChild("ConfettiGui")
-
-    local detected = false
-    local connA, connB
-
-    -- Jika sudah ada ConfettiGui dan saat ini ada partikel baru yang masuk
-    local function onAnyConfetti()
-        detected = true
-    end
-
-    -- Dengarkan munculnya ConfettiGui
-    connA = gui.ChildAdded:Connect(function(child)
-        if child.Name == "ConfettiGui" then
-            confettiGui = child
-            -- Saat frame-frame partikel ditambahkan
-            connB = child.ChildAdded:Connect(onAnyConfetti)
+    pg.ChildAdded:Connect(function(ch)
+        if ch.Name == "ConfettiGui" then
+            confettiFlag = true
         end
     end)
 
-    -- Kalau ConfettiGui sudah ada, pantau penambahan anaknya
-    if confettiGui then
-        connB = confettiGui.ChildAdded:Connect(onAnyConfetti)
-    end
+    task.spawn(function()
+        while true do
+            local gui = pg:FindFirstChild("ConfettiGui")
+            if gui and #gui:GetChildren() >= CONFETTI_MIN_CHILDREN then
+                confettiFlag = true
+            end
+            task.wait(0.05)
+        end
+    end)
+end
+setupConfettiWatch()
 
-    -- Tunggu sampai ada tanda confetti atau timeout
-    while not detected and (os.clock() - startTime) < timeoutSec do
+local function waitConfetti(timeout)
+    local t0 = os.clock()
+    while (os.clock() - t0) < (timeout or CONFETTI_TIMEOUT) do
+        if confettiFlag then confettiFlag = false; return true end
         task.wait(0.05)
     end
-
-    if connA then connA:Disconnect() end
-    if connB then connB:Disconnect() end
-    return detected
+    return false
 end
 
--- ======== Cari Portal position ========
-local function findPortalPos()
-    if PORTAL_POS then return CFrame.new(PORTAL_POS) end
-    -- Cari Part bernama "Portal"
-    local portal = workspace:FindFirstChild("Portal")
-    if portal and portal:IsA("BasePart") then
-        return portal.CFrame
+-- ========= Cari Hitbox persis =========
+local function getPortalFolder()
+    local cur = workspace
+    for _, name in ipairs(PORTAL_PATH) do
+        cur = cur:FindFirstChild(name)
+        if not cur then return nil end
     end
-    -- Cari folder "Portals"
-    local portalsFolder = workspace:FindFirstChild("Portals")
-    if portalsFolder then
-        for _, it in ipairs(portalsFolder:GetDescendants()) do
-            if it:IsA("BasePart") then
-                return it.CFrame
+    return cur
+end
+
+local function findHitboxCF()
+    local container = getPortalFolder()
+    if not container then return nil end
+    local hrp = HRP(); if not hrp then return nil end
+    local bestCF, bestDist
+    for _, d in ipairs(container:GetDescendants()) do
+        if d:IsA("BasePart") and d.Name == "Hitbox" then
+            local dist = (d.Position - hrp.Position).Magnitude
+            if not bestDist or dist < bestDist then
+                bestDist, bestCF = dist, d.CFrame
             end
         end
     end
-    -- fallback: balik ke START_POS
-    warn("[AutoTools] Portal tidak ditemukan. Set PORTAL_POS secara manual.")
-    return CFrame.new(START_POS)
+    return bestCF
 end
 
--- ======== AUTO COIN (TP + InvokeServer) ========
+-- ========= AUTO COIN =========
 local function doAutoCoinStep()
     if not pickupRF then return end
     for _, coin in ipairs(getCoinModels()) do
         if coin.Parent then
-            local cf = getModelPivotCF(coin)
+            local cf = modelPivotCF(coin)
             if cf then
                 tpCFrame(cf + Vector3.new(0, COIN_ABOVE, 0))
-                task.wait(0.10) -- beri waktu sync posisi
-                pcall(function()
-                    pickupRF:InvokeServer(coin)
-                end)
+                task.wait(0.10)
+                pcall(function() pickupRF:InvokeServer(coin) end)
                 task.wait(COIN_INTERVAL)
             end
         end
     end
 end
 
--- ======== AUTO FINISH LOOP ========
+-- ========= AUTO FINISH =========
 local function doAutoFinishCycle()
-    -- 1) TP ke START_POS
     tpVector3(START_POS)
     task.wait(0.15)
 
-    -- 2) Gerak maju-mundur 8 stud di arah hadap sekarang
-    local hrp = getHRP()
-    if not hrp then return end
+    local hrp = HRP(); if not hrp then return end
     local baseCF = hrp.CFrame
-    local lv = baseCF.LookVector
-    local fwdCF = baseCF + (lv * STEP_DIST)
-    local backCF = baseCF - (lv * STEP_DIST)
+    local look   = baseCF.LookVector
+    local fwdCF  = baseCF + (look * STEP_DIST)
+    local bakCF  = baseCF - (look * STEP_DIST)
 
-    local detected = false
     local t0 = os.clock()
-
-    while not detected and (os.clock() - t0) < CONFETTI_TIMEOUT do
+    while (os.clock() - t0) < CONFETTI_TIMEOUT do
         tweenTo(fwdCF)
-        tweenTo(backCF)
-        -- cek confetti setiap siklus
-        if waitForConfetti(0.05) then
-            detected = true
-            break
-        end
+        if confettiFlag then confettiFlag = false break end
+        tweenTo(bakCF)
+        if confettiFlag then confettiFlag = false break end
+        if waitConfetti(0.01) then break end
     end
 
-    -- 3) Jika confetti terdeteksi -> TP ke portal untuk mengulang
-    if detected then
-        local portalCF = findPortalPos()
+    local portalCF = findHitboxCF()
+    if portalCF then
         tpCFrame(portalCF + Vector3.new(0, 3, 0))
         task.wait(0.25)
     end
 end
 
--- ======== GUI ========
+-- ========= GUI =========
 local screen = Instance.new("ScreenGui")
 screen.Name = "AutoToolsUI"
 screen.ResetOnSpawn = false
 screen.Parent = LP:WaitForChild("PlayerGui")
 
-local function makeButton(text, x, y)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.fromOffset(200, 44)
-    btn.Position = UDim2.new(0, x, 0, y)
-    btn.BackgroundTransparency = 0.1
-    btn.AutoButtonColor = true
-    btn.TextScaled = true
-    btn.Text = text
-    btn.Parent = screen
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = btn
-    return btn
+local function makeBtn(label, x, y)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(200, 44)
+    b.Position = UDim2.new(0, x, 0, y)
+    b.BackgroundTransparency = 0.1
+    b.TextScaled = true
+    b.Text = label
+    b.Parent = screen
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 8); c.Parent = b
+    return b
 end
 
-local btnCoin   = makeButton("Auto Coin: OFF", 20, 70)
-local btnFinish = makeButton("Auto Finish: OFF", 20, 120)
+local btnCoin   = makeBtn("Auto Coin: OFF",   20, 70)
+local btnFinish = makeBtn("Auto Finish: OFF", 20, 120)
 
 local autoCoinOn, autoFinishOn = false, false
-local function updateBtnVisual(btn, on)
-    btn.Text = (btn == btnCoin and "Auto Coin: " or "Auto Finish: ") .. (on and "ON" or "OFF")
+local function setVisual(btn, on, prefix)
+    btn.Text = prefix .. (on and "ON" or "OFF")
     btn.BackgroundColor3 = on and Color3.fromRGB(110,220,140) or Color3.fromRGB(220,130,130)
 end
-updateBtnVisual(btnCoin,   false)
-updateBtnVisual(btnFinish, false)
+setVisual(btnCoin,   false, "Auto Coin: ")
+setVisual(btnFinish, false, "Auto Finish: ")
 
 btnCoin.MouseButton1Click:Connect(function()
     autoCoinOn = not autoCoinOn
-    updateBtnVisual(btnCoin, autoCoinOn)
+    setVisual(btnCoin, autoCoinOn, "Auto Coin: ")
 end)
 
 btnFinish.MouseButton1Click:Connect(function()
     autoFinishOn = not autoFinishOn
-    updateBtnVisual(btnFinish, autoFinishOn)
+    setVisual(btnFinish, autoFinishOn, "Auto Finish: ")
 end)
 
--- Shortcut: RightShift toggle kedua tombol bergantian
+-- Shortcut: RightShift untuk Auto Coin, RightCtrl untuk Auto Finish
 UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     if input.KeyCode == Enum.KeyCode.RightShift then
         autoCoinOn = not autoCoinOn
-        updateBtnVisual(btnCoin, autoCoinOn)
+        setVisual(btnCoin, autoCoinOn, "Auto Coin: ")
     elseif input.KeyCode == Enum.KeyCode.RightControl then
         autoFinishOn = not autoFinishOn
-        updateBtnVisual(btnFinish, autoFinishOn)
+        setVisual(btnFinish, autoFinishOn, "Auto Finish: ")
     end
 end)
 
--- ======== Loops ========
+-- ========= Loops =========
 task.spawn(function()
     while true do
-        if autoCoinOn then
-            doAutoCoinStep()
-        end
+        if autoCoinOn then doAutoCoinStep() end
         task.wait(0.1)
     end
 end)
 
 task.spawn(function()
     while true do
-        if autoFinishOn then
-            doAutoFinishCycle()
-        end
+        if autoFinishOn then doAutoFinishCycle() end
         task.wait(0.1)
     end
 end)
