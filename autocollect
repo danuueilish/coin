@@ -1,6 +1,6 @@
--- StarterPlayerScripts/AutoFarmTools_HitboxOnly.client.lua
+-- StarterPlayerScripts/AutoFarmTools_Sync.client.lua
 -- 2 tombol: Auto Coin + Auto Finish
--- Auto Finish hanya teleport ke part bernama persis "Hitbox" (bukan Hitbox1, Hitbox2, dst)
+-- Sinkronisasi diperbaiki: settle TP, dance di START_POS, confetti "baru", dan portal Hitbox (nama persis)
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -11,54 +11,67 @@ local UserInputService  = game:GetService("UserInputService")
 
 local LP = Players.LocalPlayer
 
--- ========= KONFIG =========
-local START_POS       = Vector3.new(-782.0, 97.2, 1298.0)
-local STEP_DIST       = 8
-local MOVE_TIME       = 0.25
-local COIN_INTERVAL   = 0.40
-local COIN_ABOVE      = 3
-local CONFETTI_TIMEOUT= 10
-local CONFETTI_MIN_CHILDREN = 40
-local PORTAL_PATH = {"Ending","Portal","Portal"} -- folder berisi Hitbox
+-- ====== KONFIG ======
+local START_POS        = Vector3.new(-782.0, 97.2, 1298.0)
+local STEP_DIST        = 8
+local MOVE_TIME        = 0.30      -- sedikit lebih lambat agar stabil
+local BETWEEN_TWEENS   = 0.05
+local COIN_INTERVAL    = 0.35
+local COIN_ABOVE       = 3
+local CONFETTI_TIMEOUT = 10
+local CONFETTI_MIN_NEW = 5         -- minimal pertambahan child agar dianggap confetti baru
+local START_TOLERANCE  = 6         -- harus sedekat ini dari START_POS untuk mulai dance
 
--- ========= UTIL =========
+local PORTAL_PATH = {"Ending","Portal","Portal"} -- folder berisi banyak Hitbox
+local HITBOX_NAME = "Hitbox"                     -- nama persis
+
+-- ====== UTIL ======
+local function waitForCharacter()
+    if LP.Character and LP.Character:FindFirstChild("HumanoidRootPart") then return end
+    LP.CharacterAdded:Wait()
+    LP.Character:WaitForChild("HumanoidRootPart")
+end
+
 local function HRP()
     local char = LP.Character
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
+local function dist(a, b) return (a - b).Magnitude end
+
 local function tpCFrame(cf)
+    waitForCharacter()
     local hrp = HRP(); if not hrp then return false end
-    hrp.CFrame = cf; return true
+    hrp.CFrame = cf
+    return true
 end
 
-local function tpVector3(v)
-    return tpCFrame(CFrame.new(v))
-end
+local function tpVector3(v) return tpCFrame(CFrame.new(v)) end
 
 local function tweenTo(cfTo, t)
     local hrp = HRP(); if not hrp then return false end
     local tw = TweenService:Create(hrp, TweenInfo.new(t or MOVE_TIME, Enum.EasingStyle.Linear), {CFrame = cfTo})
-    tw:Play(); tw.Completed:Wait(); return true
+    tw:Play(); tw.Completed:Wait()
+    return true
 end
 
--- ========= PickupCoin RF =========
+-- ====== RemoteFunction PickupCoin (cari dinamis) ======
 local function findPickupRF()
-    local folder = ReplicatedStorage:FindFirstChild("RemoteFunctions")
-    if folder then
-        local rf = folder:FindFirstChild("PickupCoin")
+    local f = ReplicatedStorage:FindFirstChild("RemoteFunctions")
+    if f then
+        local rf = f:FindFirstChild("PickupCoin")
         if rf and rf:IsA("RemoteFunction") then return rf end
     end
-    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-        if obj:IsA("RemoteFunction") and obj.Name == "PickupCoin" then
-            return obj
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if d:IsA("RemoteFunction") and d.Name == "PickupCoin" then
+            return d
         end
     end
     return nil
 end
 local pickupRF = findPickupRF()
 
--- ========= Coin list =========
+-- ====== Coin helpers ======
 local function getCoinModels()
     local t = {}
     local folder = workspace:FindFirstChild("PickupCoin")
@@ -80,40 +93,30 @@ local function modelPivotCF(model)
     return nil
 end
 
--- ========= Confetti detector =========
-local confettiFlag = false
-local function setupConfettiWatch()
-    confettiFlag = false
-    local pg = LP:WaitForChild("PlayerGui")
-
-    pg.ChildAdded:Connect(function(ch)
-        if ch.Name == "ConfettiGui" then
-            confettiFlag = true
-        end
-    end)
-
-    task.spawn(function()
-        while true do
-            local gui = pg:FindFirstChild("ConfettiGui")
-            if gui and #gui:GetChildren() >= CONFETTI_MIN_CHILDREN then
-                confettiFlag = true
-            end
-            task.wait(0.05)
-        end
-    end)
+-- ====== Confetti detector: hanya hitung confetti BARU di siklus ini ======
+local function snapshotConfettiCount()
+    local pg  = LP:WaitForChild("PlayerGui")
+    local gui = pg:FindFirstChild("ConfettiGui")
+    return gui and #gui:GetChildren() or 0
 end
-setupConfettiWatch()
 
-local function waitConfetti(timeout)
+local function waitConfettiNew(timeout, baseCount)
+    local pg = LP:WaitForChild("PlayerGui")
     local t0 = os.clock()
     while (os.clock() - t0) < (timeout or CONFETTI_TIMEOUT) do
-        if confettiFlag then confettiFlag = false; return true end
+        local gui = pg:FindFirstChild("ConfettiGui")
+        if gui then
+            local now = #gui:GetChildren()
+            if (now - baseCount) >= CONFETTI_MIN_NEW then
+                return true
+            end
+        end
         task.wait(0.05)
     end
     return false
 end
 
--- ========= Cari Hitbox persis =========
+-- ====== Portal Hitbox ======
 local function getPortalFolder()
     local cur = workspace
     for _, name in ipairs(PORTAL_PATH) do
@@ -123,23 +126,23 @@ local function getPortalFolder()
     return cur
 end
 
-local function findHitboxCF()
+local function findNearestHitboxCF()
     local container = getPortalFolder()
     if not container then return nil end
     local hrp = HRP(); if not hrp then return nil end
     local bestCF, bestDist
     for _, d in ipairs(container:GetDescendants()) do
-        if d:IsA("BasePart") and d.Name == "Hitbox" then
-            local dist = (d.Position - hrp.Position).Magnitude
-            if not bestDist or dist < bestDist then
-                bestDist, bestCF = dist, d.CFrame
+        if d:IsA("BasePart") and d.Name == HITBOX_NAME then
+            local dd = (d.Position - hrp.Position).Magnitude
+            if not bestDist or dd < bestDist then
+                bestDist, bestCF = dd, d.CFrame
             end
         end
     end
     return bestCF
 end
 
--- ========= AUTO COIN =========
+-- ====== AUTO COIN ======
 local function doAutoCoinStep()
     if not pickupRF then return end
     for _, coin in ipairs(getCoinModels()) do
@@ -155,12 +158,27 @@ local function doAutoCoinStep()
     end
 end
 
--- ========= AUTO FINISH =========
+-- ====== AUTO FINISH ======
+local function ensureAtStart()
+    -- TP sampai benar-benar dekat START_POS
+    for _ = 1, 5 do
+        tpVector3(START_POS)
+        task.wait(0.20)
+        local hrp = HRP()
+        if hrp and dist(hrp.Position, START_POS) <= START_TOLERANCE then
+            return true
+        end
+    end
+    return false
+end
+
 local function doAutoFinishCycle()
-    tpVector3(START_POS)
-    task.wait(0.15)
+    if not ensureAtStart() then return end
 
     local hrp = HRP(); if not hrp then return end
+    -- snapshot confetti awal (supaya cuma tangkap yang BARU)
+    local baseCount = snapshotConfettiCount()
+
     local baseCF = hrp.CFrame
     local look   = baseCF.LookVector
     local fwdCF  = baseCF + (look * STEP_DIST)
@@ -168,21 +186,33 @@ local function doAutoFinishCycle()
 
     local t0 = os.clock()
     while (os.clock() - t0) < CONFETTI_TIMEOUT do
+        -- selalu pastikan tetap dekat start; kalau meleset (respawn/ketarik), balik
+        if dist(HRP().Position, START_POS) > (START_TOLERANCE + 2) then
+            if not ensureAtStart() then break end
+            baseCF = HRP().CFrame
+            look   = baseCF.LookVector
+            fwdCF  = baseCF + (look * STEP_DIST)
+            bakCF  = baseCF - (look * STEP_DIST)
+        end
+
         tweenTo(fwdCF)
-        if confettiFlag then confettiFlag = false break end
+        task.wait(BETWEEN_TWEENS)
+        if waitConfettiNew(0.01, baseCount) then break end
+
         tweenTo(bakCF)
-        if confettiFlag then confettiFlag = false break end
-        if waitConfetti(0.01) then break end
+        task.wait(BETWEEN_TWEENS)
+        if waitConfettiNew(0.01, baseCount) then break end
     end
 
-    local portalCF = findHitboxCF()
+    -- ke portal (Hitbox persis)
+    local portalCF = findNearestHitboxCF()
     if portalCF then
         tpCFrame(portalCF + Vector3.new(0, 3, 0))
         task.wait(0.25)
     end
 end
 
--- ========= GUI =========
+-- ====== GUI ======
 local screen = Instance.new("ScreenGui")
 screen.Name = "AutoToolsUI"
 screen.ResetOnSpawn = false
@@ -211,39 +241,44 @@ end
 setVisual(btnCoin,   false, "Auto Coin: ")
 setVisual(btnFinish, false, "Auto Finish: ")
 
-btnCoin.MouseButton1Click:Connect(function()
-    autoCoinOn = not autoCoinOn
+local function turnCoin(on)
+    autoCoinOn = on
     setVisual(btnCoin, autoCoinOn, "Auto Coin: ")
-end)
+end
 
-btnFinish.MouseButton1Click:Connect(function()
-    autoFinishOn = not autoFinishOn
+local function turnFinish(on)
+    autoFinishOn = on
     setVisual(btnFinish, autoFinishOn, "Auto Finish: ")
-end)
+    if on then
+        -- demi stabilitas: matikan Auto Coin saat Auto Finish aktif
+        if autoCoinOn then turnCoin(false) end
+    end
+end
 
--- Shortcut: RightShift untuk Auto Coin, RightCtrl untuk Auto Finish
+btnCoin.MouseButton1Click:Connect(function() turnCoin(not autoCoinOn) end)
+btnFinish.MouseButton1Click:Connect(function() turnFinish(not autoFinishOn) end)
+
+-- Shortcut: RightShift (Auto Coin), RightCtrl (Auto Finish)
 UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     if input.KeyCode == Enum.KeyCode.RightShift then
-        autoCoinOn = not autoCoinOn
-        setVisual(btnCoin, autoCoinOn, "Auto Coin: ")
+        turnCoin(not autoCoinOn)
     elseif input.KeyCode == Enum.KeyCode.RightControl then
-        autoFinishOn = not autoFinishOn
-        setVisual(btnFinish, autoFinishOn, "Auto Finish: ")
+        turnFinish(not autoFinishOn)
     end
 end)
 
--- ========= Loops =========
+-- ====== Loops ======
 task.spawn(function()
     while true do
         if autoCoinOn then doAutoCoinStep() end
-        task.wait(0.1)
+        task.wait(0.05)
     end
 end)
 
 task.spawn(function()
     while true do
         if autoFinishOn then doAutoFinishCycle() end
-        task.wait(0.1)
+        task.wait(0.05)
     end
 end)
